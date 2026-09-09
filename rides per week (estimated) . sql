@@ -1,0 +1,252 @@
+-- ==========================================================================
+-- VALIDATE: "Rides per week (estimated)"
+--
+-- Recomputes the chart from source, independently of the Hex cells. Run in
+-- the Trino adhoc window, then compare row by row.
+--
+-- One statement. Paste the whole thing. No semicolons anywhere.
+-- Always reads live data. The programme start date is hardcoded, everything
+-- else is relative, so new weeks appear automatically.
+--
+-- ┌────────────────────────────────────────────────────────────────────────┐
+-- │ HOW TO COMPARE                                                         │
+-- │                                                                        │
+-- │ Set the dashboard's market filter to ALL, then match SECTION A:        │
+-- │   est_rides            = the blue bars (left axis)                     │
+-- │   rides_per_veh_day    = the orange line (right axis)                  │
+-- │                                                                        │
+-- │ To check the filtered view, select one market and match SECTION B.     │
+-- └────────────────────────────────────────────────────────────────────────┘
+--
+-- ══ THIS IS THE ONE METRIC THAT LEGITIMATELY MOVES BETWEEN RUNS ══
+--
+--   Ride counts are recorded PER RENTAL, not per day. Rentals are anchored
+--   to each driver's own pickup time, so almost every rental straddles two
+--   Monday-Sunday weeks. Rides are therefore SPLIT BY TIME OVERLAP -- if a
+--   rental covered 3 days of one week and 4 of the next, its rides are
+--   apportioned 3/7 and 4/7.
+--
+--   NOTE ON SECTION D: it uses a spine that INCLUDES the in-flight week,
+--   while sections A-C stop at the last complete week. Otherwise the
+--   comparison would always show a shortfall equal to the current partial
+--   week's rides -- a window mismatch, not a proration failure.
+--
+--   That means the figure re-derives on every run. As an open rental
+--   lengthens, its overlap shares shift and previously-reported weeks move
+--   slightly. One observed example: the same week read 529 rides one day
+--   and 499 the next. Neither was wrong.
+--
+--   A few percent of drift is normal. A large jump is not, and usually
+--   means a rental was added, removed or re-dated.
+--
+--   The split assumes even driving across the rental. It is an estimate at
+--   driver-week level. Weekly and market TOTALS are sound -- proration
+--   redistributes rides between weeks without creating or destroying any,
+--   and that conservation has been verified against the raw totals.
+--
+-- THREE MORE THINGS THAT LOOK WRONG BUT ARE NOT
+--
+--   1. THE IN-FLIGHT WEEK IS EXCLUDED. Only complete Mon-Sun weeks appear.
+--      A partial week would show a collapse in rides that is really just
+--      the week not having finished.
+--
+--   2. rides_per_veh_day IS A POOLED RATE, not an average of per-driver
+--      rates. Total rides divided by total vehicle-days on rent. A car that
+--      arrived on Friday contributes 2 days, not 7, so it does not drag the
+--      figure down the way a per-vehicle average would. This is the metric
+--      to trust during the fleet ramp -- total rides and rides-per-vehicle
+--      both move when vehicles arrive mid-week even if nobody drove
+--      differently.
+--
+--   3. THE FIRST PROGRAMME WEEK LOOKS BROKEN. One driver, a few days, a
+--      handful of rides. Correct -- that is what the first week was.
+--
+-- WHAT THIS PROVES
+--   That the dashboard's proration and aggregation are right. It reads the
+--   same rental table, so it cannot independently verify the ride counts
+--   themselves. Section D is the closest thing to that -- it checks that
+--   prorated rides still sum to the raw totals.
+-- ==========================================================================
+
+with fm_vins as (
+    -- The vehicle cohort.
+    --
+    -- model like 'Cla%' IS DELIBERATE. One VIN carries model = 'Cla' while
+    -- the other 24 read 'Cla-Class Ev'. An exact match silently dropped that
+    -- car -- live and on rent at the time -- along with the entire PHI
+    -- market and its rides. Do not tighten this.
+    --
+    -- ds filter required, LOWER BOUND ONLY. Open status intervals carry the
+    -- sentinel 9999-01-01, so an upper bound drops the live fleet.
+    select distinct upper(trim(vin)) as vin
+    from xdsa.xd_fleet_status_interval
+    where vehicle_class          = 'WP_HYBRID'
+      and make                   = 'Mercedes-Benz'
+      and model like 'Cla%'
+      and vehicle_provider_id    = 'FLEXDRIVE'
+      and vehicle_operation_type = 'RENTAL'
+      and ds >= '2026-01-01'
+),
+
+rentals as (
+    -- Zero-length rentals excluded: one exists (start = end = 2026-08-20,
+    -- replaced the same day) and would double-count a driver-week.
+    --
+    -- Open rentals use current_timestamp as the end, which is why their
+    -- overlap shares shift between runs.
+    select
+        r.rental_id,
+        cast(r.lyft_id as varchar)                      as driver_id,
+        upper(trim(r.vin))                              as vin,
+        r.region                                        as market,
+        r.start_date_time,
+        coalesce(r.end_date_time, current_timestamp)    as end_or_now,
+        r.completed_rides,
+        r.classic_rides,
+        r.plus_rides,
+        r.line_rides
+    from core.dimension_rentals r
+    join fm_vins v on v.vin = upper(trim(r.vin))
+    where r.end_date_time is null
+       or r.end_date_time > r.start_date_time
+),
+
+weeks as (
+    -- Complete Mon-Sun weeks only. The upper bound is relative, so new
+    -- weeks are picked up as they finish.
+    select
+        w                                       as week_start,
+        cast(w as timestamp)                    as week_start_ts,
+        cast(w + interval '7' day as timestamp) as week_end_ts
+    from unnest(sequence(
+        date '2026-08-03',
+        date_trunc('week', current_date) - interval '7' day,
+        interval '7' day
+    )) as t(w)
+),
+
+overlap as (
+    -- The proration step. Strict inequalities so a rental merely touching a
+    -- week boundary is not counted into that week.
+    --
+    -- week_share is the fraction of the rental falling inside this week.
+    -- overlap_days is the vehicle-days on rent, which becomes the
+    -- denominator of the rate.
+    select
+        wk.week_start,
+        r.driver_id,
+        r.vin,
+        r.market,
+        r.rental_id,
+        date_diff('second',
+            greatest(r.start_date_time, wk.week_start_ts),
+            least(r.end_or_now,         wk.week_end_ts)) / 86400.0  as overlap_days,
+        cast(date_diff('second',
+                greatest(r.start_date_time, wk.week_start_ts),
+                least(r.end_or_now,         wk.week_end_ts)) as double)
+            / nullif(date_diff('second', r.start_date_time, r.end_or_now), 0)
+                                                                    as week_share,
+        r.completed_rides
+    from weeks wk
+    join rentals r
+      on r.start_date_time < wk.week_end_ts
+     and r.end_or_now      > wk.week_start_ts
+),
+
+overlap_full as (
+    -- SAME proration, but the spine runs through the IN-FLIGHT week too.
+    -- Used ONLY by the conservation check in section D.
+    --
+    -- Sections A-C deliberately stop at the last complete week, so their
+    -- total excludes rides in the current partial week. Comparing that
+    -- against the raw rental totals would always show a shortfall -- not a
+    -- proration failure, just two different windows. This CTE covers every
+    -- day of every rental so the comparison is like for like.
+    select
+        r.completed_rides
+        * cast(date_diff('second',
+                greatest(r.start_date_time, cast(w as timestamp)),
+                least(r.end_or_now, cast(w + interval '7' day as timestamp))) as double)
+          / nullif(date_diff('second', r.start_date_time, r.end_or_now), 0)
+                                                    as prorated_rides
+    from rentals r
+    cross join unnest(sequence(
+        date '2026-08-03',
+        date_trunc('week', current_date),
+        interval '7' day
+    )) as t(w)
+    where r.start_date_time < cast(w + interval '7' day as timestamp)
+      and r.end_or_now      > cast(w as timestamp)
+)
+
+-- ---- SECTION A: all markets -- matches the chart with no filter ----------
+select
+    'A ALL MARKETS'                                     as section,
+    cast(week_start as varchar)                         as week,
+    ''                                                  as market,
+    cast(cast(round(sum(completed_rides * week_share), 0) as decimal(12,0)) as varchar) as est_rides,
+    cast(count(distinct driver_id) as varchar)          as drivers,
+    cast(count(distinct vin) as varchar)                as vehicles,
+    cast(cast(round(sum(overlap_days), 1) as decimal(10,1)) as varchar)        as vehicle_days,
+    cast(cast(round(sum(completed_rides * week_share) / nullif(sum(overlap_days), 0), 1) as decimal(10,1)) as varchar)
+                                                        as rides_per_veh_day
+from overlap
+where overlap_days > 0
+group by week_start
+
+union all
+
+-- ---- SECTION B: by market -- matches the chart when filtered -------------
+select
+    'B BY MARKET',
+    cast(week_start as varchar),
+    market,
+    cast(cast(round(sum(completed_rides * week_share), 0) as decimal(12,0)) as varchar),
+    cast(count(distinct driver_id) as varchar),
+    cast(count(distinct vin) as varchar),
+    cast(cast(round(sum(overlap_days), 1) as decimal(10,1)) as varchar),
+    cast(cast(round(sum(completed_rides * week_share) / nullif(sum(overlap_days), 0), 1) as decimal(10,1)) as varchar)
+from overlap
+where overlap_days > 0
+group by week_start, market
+
+union all
+
+-- ---- SECTION C: programme total ------------------------------------------
+-- Cross-check against the "Total rides" tile.
+select
+    'C TOTAL', '', '',
+    cast(cast(round(sum(completed_rides * week_share), 0) as decimal(12,0)) as varchar),
+    cast(count(distinct driver_id) as varchar),
+    cast(count(distinct vin) as varchar),
+    cast(cast(round(sum(overlap_days), 1) as decimal(10,1)) as varchar),
+    cast(cast(round(sum(completed_rides * week_share) / nullif(sum(overlap_days), 0), 1) as decimal(10,1)) as varchar)
+from overlap
+where overlap_days > 0
+
+union all
+
+-- ---- SECTION D: conservation check ---------------------------------------
+-- Proration must redistribute rides between weeks WITHOUT creating or
+-- destroying any. prorated_total should equal raw_total to within rounding.
+--
+-- If they diverge, either a rental falls outside the week spine (check the
+-- 2026-08-03 start date) or a rental is being counted into two weeks at
+-- full weight rather than split.
+--
+-- Also checks that completed_rides equals classic + plus + line. A mismatch
+-- would mean some ride type is not captured in those three columns and the
+-- totals are understated.
+select
+    'D CONSERVATION', '', '',
+    cast(cast((select round(sum(prorated_rides), 0) from overlap_full) as decimal(12,0)) as varchar),
+    cast((select sum(completed_rides) from rentals) as varchar),
+    cast((select sum(classic_rides + plus_rides + line_rides) from rentals) as varchar),
+    case when abs((select sum(prorated_rides) from overlap_full)
+                - (select sum(completed_rides) from rentals)) < 1
+         then 'PASS' else 'CHECK' end,
+    case when (select count_if(completed_rides
+                <> classic_rides + plus_rides + line_rides) from rentals) = 0
+         then 'PASS' else 'CHECK ride types' end
+
+order by 1, 2, 3
