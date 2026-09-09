@@ -1,0 +1,218 @@
+-- ==========================================================================
+-- VALIDATE: "Bonus tier attainment by week"
+--
+-- Recomputes the chart from source, independently of the Hex cells. Run in
+-- the Trino adhoc window, then compare row by row.
+--
+-- One statement. Paste the whole thing. No semicolons anywhere.
+-- Always reads live data -- the only hardcoded dates are lower bounds and
+-- the programme start, so new weeks appear automatically.
+--
+-- ┌────────────────────────────────────────────────────────────────────────┐
+-- │ HOW TO COMPARE                                                         │
+-- │                                                                        │
+-- │ Set the dashboard's market filter to ALL, then match SECTION A:        │
+-- │   bar_height   = the total stacked bar height for that week            │
+-- │   n_top / n_mid / n_low / n_none = the four stacked segments           │
+-- │   pct_any_tier = the orange line                                       │
+-- │                                                                        │
+-- │ To check the filtered view, select one market and match SECTION B.     │
+-- └────────────────────────────────────────────────────────────────────────┘
+--
+-- FOUR THINGS THAT LOOK WRONG BUT ARE NOT
+--
+--   1. THE MOST RECENT COMPLETE WEEK IS ABSENT from section A and B.
+--      Bonuses are disbursed the Tuesday after the week they are earned, so
+--      that week has no payouts yet. It appears in section C with a driver
+--      count and null tiers. On the dashboard it shows as a gap, not a zero.
+--      Absence here is correct.
+--
+--   2. TIER MIX SHIFTS ARE NOT PERFORMANCE CHANGES. Thresholds prorate for
+--      partial rental weeks -- a Thursday pickup needs 60 x 3/7 = 25.7 hours
+--      for Top tier, not 60. So a driver can drive MORE hours and drop a
+--      tier once they move onto a full week. That is exactly what happened
+--      between the first two paid weeks: all four drivers present in both
+--      drove 18-42 more hours, two showed a lower tier, and their pay rose
+--      from $107 to $175. Compare hours, not tiers.
+--
+--   3. PERCENTAGES SWING ON SMALL COUNTS. At 6-7 driver-weeks, one driver
+--      moves attainment by roughly 17 points. Read n_top/n_mid/n_low, not
+--      the percentage.
+--
+--   4. n_none IS DERIVED as drivers minus those paid. A driver who held a
+--      vehicle but earned nothing lands here. It is not a separate ledger
+--      entry.
+--
+-- WHAT THIS PROVES
+--   That the dashboard aggregates the bonus ledger correctly. It reads the
+--   same tables, so it cannot prove the ledger itself is right. The
+--   independent check for that is the payout tracker spreadsheet.
+-- ==========================================================================
+
+with fm_vins as (
+    -- The vehicle cohort.
+    --
+    -- model like 'Cla%' IS DELIBERATE. One VIN carries model = 'Cla' while
+    -- the other 24 read 'Cla-Class Ev'. An exact match silently dropped that
+    -- car -- live and on rent at the time -- along with the entire PHI
+    -- market. Do not tighten this.
+    --
+    -- ds filter required, LOWER BOUND ONLY. Open status intervals carry the
+    -- sentinel 9999-01-01, so an upper bound drops the live fleet.
+    select distinct upper(trim(vin)) as vin
+    from xdsa.xd_fleet_status_interval
+    where vehicle_class          = 'WP_HYBRID'
+      and make                   = 'Mercedes-Benz'
+      and model like 'Cla%'
+      and vehicle_provider_id    = 'FLEXDRIVE'
+      and vehicle_operation_type = 'RENTAL'
+      and ds >= '2026-01-01'
+),
+
+legal_tiers (amount_usd, bonus_tier) as (
+    -- 3 tiers x 7 day-fractions, prorated. Anything NOT on this list is not
+    -- a mapping bonus -- localOfficeStaffBonusDriver is a generic manual
+    -- adjustment bucket that also carries tow-downtime refunds, flat-tire
+    -- compensation and mileage corrections.
+    --
+    -- $100 is the one amount two tiers can produce: Low at 5/7 and Mid at
+    -- 4/7 both equal it. Flagged AMBIGUOUS rather than guessed. None has
+    -- been paid yet. If one appears, resolve from days on rent -- 5 = Low,
+    -- 4 = Mid -- and it will show up in the ambiguous column below.
+    values
+        (140.00,'1 - Low'),   (175.00,'2 - Mid'), (250.00,'3 - Top'),
+        (120.00,'1 - Low'),   (150.00,'2 - Mid'), (214.29,'3 - Top'),
+        (100.00,'AMBIGUOUS'), (125.00,'2 - Mid'), (178.57,'3 - Top'),
+        ( 80.00,'1 - Low'),                       (142.86,'3 - Top'),
+        ( 60.00,'1 - Low'),   ( 75.00,'2 - Mid'), (107.14,'3 - Top'),
+        ( 40.00,'1 - Low'),   ( 50.00,'2 - Mid'), ( 71.43,'3 - Top'),
+        ( 20.00,'1 - Low'),   ( 25.00,'2 - Mid'), ( 35.71,'3 - Top')
+),
+
+driver_weeks as (
+    -- Every (driver, market, Mon-Sun week) where the driver held a program
+    -- vehicle. This is the DENOMINATOR -- everyone who had a car, not just
+    -- those who got paid.
+    --
+    -- Expanding to days then truncating handles rentals straddling week
+    -- boundaries. Rentals are anchored to each driver's own pickup time, so
+    -- effectively every rental straddles two calendar weeks.
+    --
+    -- Zero-length rentals excluded: one exists (start = end = 2026-08-20,
+    -- replaced the same day) and would double-count a driver-week.
+    select distinct
+        cast(r.lyft_id as varchar)      as driver_id,
+        r.region                        as market,
+        date(date_trunc('week', d))     as week_start
+    from core.dimension_rentals r
+    join fm_vins v on v.vin = upper(trim(r.vin))
+    cross join unnest(sequence(
+        date(r.start_date_time),
+        date(coalesce(r.end_date_time, current_timestamp)),
+        interval '1' day
+    )) as t(d)
+    where r.end_date_time is null
+       or r.end_date_time > r.start_date_time
+),
+
+bonuses as (
+    -- event_driver_bonus is an EVENT log, not a state table. One bonus emits
+    -- several rows as it moves pending -> finalized, so dedupe on bonus_id
+    -- or every total doubles.
+    --
+    -- earning_week is derived: payouts land the Tuesday AFTER the week the
+    -- hours were earned, hence minus 7 days.
+    select
+        b.driver_id,
+        round(b.amount_cents/100.0, 2)  as amount_usd,
+        date(date_trunc('week', b.occurred_at) - interval '7' day) as week_start,
+        t.bonus_tier,
+        row_number() over (partition by b.bonus_id order by b.occurred_at desc) as rn
+    from default.event_driver_bonus b
+    join legal_tiers t on t.amount_usd = round(b.amount_cents/100.0, 2)
+    where b.ds >= '2026-08-01'
+      and b.bonus_type = 'localOfficeStaffBonusDriver'
+      and b.state      = 'finalized'
+),
+
+scoped as (
+    -- *** THIS JOIN IS LOAD-BEARING ***
+    -- Scopes payouts to program driver-weeks. Without it an unrelated
+    -- local-office bonus leaks in -- the first build of this returned
+    -- $857.14 for a week whose real total was $607.14. Scoped on driver AND
+    -- week, so a bonus paid to a program driver in a week they were not
+    -- holding a program vehicle is also correctly excluded.
+    select bo.*, dw.market
+    from bonuses bo
+    join driver_weeks dw
+      on dw.driver_id = bo.driver_id and dw.week_start = bo.week_start
+    where bo.rn = 1
+),
+
+weekly_denom as (
+    select week_start, count(distinct driver_id) as drivers
+    from driver_weeks group by 1
+),
+
+market_denom as (
+    select week_start, market, count(distinct driver_id) as drivers
+    from driver_weeks group by 1, 2
+)
+
+-- ---- SECTION A: all markets -- matches the chart with no filter ----------
+select
+    'A ALL MARKETS'                             as section,
+    cast(d.week_start as varchar)               as week,
+    ''                                          as market,
+    cast(d.drivers as varchar)                  as bar_height,
+    cast(count_if(s.bonus_tier = '3 - Top') as varchar)   as n_top,
+    cast(count_if(s.bonus_tier = '2 - Mid') as varchar)   as n_mid,
+    cast(count_if(s.bonus_tier = '1 - Low') as varchar)   as n_low,
+    cast(d.drivers - count(s.driver_id) as varchar)       as n_none,
+    cast(count_if(s.bonus_tier = 'AMBIGUOUS') as varchar) as ambiguous,
+    cast(round(100.0 * count(s.driver_id) / nullif(d.drivers, 0), 1) as varchar) || '%'
+                                                          as pct_any_tier
+from weekly_denom d
+left join scoped s on s.week_start = d.week_start
+group by d.week_start, d.drivers
+having count(s.driver_id) > 0
+
+union all
+
+-- ---- SECTION B: by market -- matches the chart when filtered -------------
+select
+    'B BY MARKET',
+    cast(m.week_start as varchar),
+    m.market,
+    cast(m.drivers as varchar),
+    cast(count_if(s.bonus_tier = '3 - Top') as varchar),
+    cast(count_if(s.bonus_tier = '2 - Mid') as varchar),
+    cast(count_if(s.bonus_tier = '1 - Low') as varchar),
+    cast(m.drivers - count(s.driver_id) as varchar),
+    cast(count_if(s.bonus_tier = 'AMBIGUOUS') as varchar),
+    cast(round(100.0 * count(s.driver_id) / nullif(m.drivers, 0), 1) as varchar) || '%'
+from market_denom m
+left join scoped s
+  on s.week_start = m.week_start and s.market = m.market
+group by m.week_start, m.market, m.drivers
+having count(s.driver_id) > 0
+
+union all
+
+-- ---- SECTION C: weeks awaiting payout -----------------------------------
+-- These have drivers but no bonuses yet. On the chart they show as a gap
+-- rather than a zero. If a week appears here that should have been paid,
+-- the payout run has not happened or the earning-week derivation is off.
+select
+    'C PENDING',
+    cast(d.week_start as varchar),
+    '',
+    cast(d.drivers as varchar),
+    '', '', '', '', '',
+    'awaiting payout'
+from weekly_denom d
+left join scoped s on s.week_start = d.week_start
+group by d.week_start, d.drivers
+having count(s.driver_id) = 0
+
+order by 1, 2, 3
