@@ -23,7 +23,7 @@
 --    a) FULL EVENT — any minute in the hour had Launchable <= 3 AND
 --       In-Service <= 3. Catches full pauses and de-fleets.
 --       Using "any minute" rather than the hourly average is deliberate:
---       it captures the partial hours at event boundaries. The Aug 20
+--       it captures the partial hours at event boundaries. The Aug 20,2026
 --       pause began at 02:50, so the 02:00 hour averages 43 Launchable
 --       but is genuinely disrupted.
 --
@@ -35,7 +35,7 @@
 --
 --       The 70% trigger equates to roughly 50% Launchable-of-Capable,
 --       against a normal clean-hour KPI of ~72% and a 78% CSL target.
---       Only 0.9% of clean hours dip below that line naturally.
+--       Only 0.9% of clean hours dip below that line naturally as of Sept 11,2026.
 --
 --       THE TRIGGER IS DYNAMIC. The benchmark is recomputed per week per
 --       shift, so it tracks the fleet. As the fleet grew 65 -> 91 vehicles
@@ -93,8 +93,7 @@
 --     causes using this field.
 --   - Shift type comes from date_time_info.peak_classification.demand,
 --     NOT supply. Validated against the manual Shift Grid: 71/71 day-hour
---     combinations match, so the Shift Grid tab is redundant.
---   - Uses funnel_stage.cumulative (not .ultimate).
+--     combinations match, so the Shift Grid tab in excel is redundant.
 --   - Period starts 2026-06-09, when Lyft operations began. Earlier data
 --     is pre-launch and would distort the benchmark.
 --   - Revenue at $4 per RO Ready supply hour (DP1 service fee). This is a
@@ -116,10 +115,10 @@ base AS (
     metrics_set.vehicle.funnel_stage.cumulative.in_service.minutes    AS in_service,
     metrics_set.vehicle.funnel_stage.cumulative.ro_pool.minutes       AS pool
   FROM waymo_data.ro_utilization.operation_timeline_tvc
-  WHERE CAST(ops_depot AS STRING) = "NASHVILLE"
-    AND local_date >= DATE "2026-06-09"
+  WHERE CAST(ops_depot AS STRING) = "NASHVILLE" -- naville onlt
+    AND local_date >= DATE "2026-06-09" -- since launch only
     AND date_time_info.peak_classification.demand.peak_category
-        IN ("Off-peak", "Peak", "Standard")
+        IN ("Off-peak", "Peak", "Standard") 
 ),
 
 -- STEP 2a: collapse to hourly; flag FULL events ------------------------
@@ -217,7 +216,7 @@ SELECT
   CAST(SUM(f.is_full_event) AS INT64)            AS full_event_hours,
   CAST(SUM(f.is_partial_event) AS INT64)         AS partial_event_hours,
   CAST(SUM(f.is_recovery) AS INT64)              AS recovery_hours,
-  CAST(SUM(f.weather_flag) AS INT64)             AS weather_flagged_hours,
+  CAST(SUM(f.weather_flag) AS INT64)             AS weather_flagged_hours, --- But it currently returns 0 everywhere.Once it's populated, this column starts returning real values and you can split weather from ops-driven causes without changing anything else in the query.
   ROUND(b.benchmark, 4)                          AS clean_hour_benchmark,
 
   ROUND(SUM(f.launchable), 4)                    AS actual_launchable_hrs,
