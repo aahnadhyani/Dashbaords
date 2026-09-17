@@ -1,4 +1,4 @@
-"-- ============================================================================
+-- ============================================================================
 -- WAYMO NASHVILLE — IMPACT OF FLEET PAUSES & DE-FLEETING ON RO LAUNCHABLE
 -- ============================================================================
 --
@@ -7,8 +7,8 @@
 --   lose? And what would our RO Launchable % have been if it hadn't happened?
 --
 -- THE SHORT VERSION OF THE METHOD
---   For each week, split the hours into ""something went wrong"" and ""nothing
---   went wrong"". Average the good hours to get a benchmark for what a normal
+--   For each week, split the hours into "something went wrong" and "nothing
+--   went wrong". Average the good hours to get a benchmark for what a normal
 --   hour looked like that week. Then credit every bad hour at that benchmark
 --   instead of what actually happened. The difference is the loss.
 --
@@ -139,7 +139,7 @@ hourly AS (
 --   flagged, 3 are flagged at the start and unflagged at the tail, 1 has no
 --   weather flag at all (the 8/14 lug nut inspection). There is not a single
 --   case of the flag dropping out MID-outage — the pattern is always
---   ""WWWW."" never ""WW.W"" — so this is safe to treat as a tail effect.
+--   "WWWW." never "WW.W" — so this is safe to treat as a tail effect.
 --
 -- WHAT COUNTS
 --   A zero hour, not weather-flagged, where the current unbroken run of zero
@@ -273,7 +273,7 @@ partials AS (
   JOIN bench_p1 b USING (week_start, shift)
 ),
 
--- an hour is an ""event"" if it falls into any of the four categories above
+-- an hour is an "event" if it falls into any of the four categories above
 event_flagged AS (
   SELECT *,
     GREATEST(is_weather, is_weather_tail_full, is_ops_full, is_ops_partial) AS is_event
@@ -298,7 +298,7 @@ bench_p2 AS (
 -- WHY THESE HOURS MATTER
 --   After an outage the fleet does not snap straight back to normal — vehicles
 --   have to be redeployed. Those hours are still depressed BY the event. If we
---   left them in the ""clean"" pool they would drag the benchmark down and we
+--   left them in the "clean" pool they would drag the benchmark down and we
 --   would understate the loss.
 --
 -- THE RULE
@@ -446,4 +446,4 @@ SELECT
 FROM flagged f
 JOIN bench_final b USING (week_start, shift)
 GROUP BY f.local_date, f.week_start, f.shift, b.benchmark
-ORDER BY f.local_date, f.shift"
+ORDER BY f.local_date, f.shift
